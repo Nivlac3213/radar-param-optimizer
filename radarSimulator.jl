@@ -30,6 +30,7 @@ end
 mutable struct Receiver
     position::SVector{2, Float64}
     received_power::Vector{Float64}
+    min_receive_time::Float64  # ignore samples until this time
 end
 
 # Radar environment
@@ -121,7 +122,7 @@ function propagate!(env::RadarEnvironment)
                 end
 
                 # --- Pulse propagation ---
-                t_arrival = r / 300
+                t_arrival = r / 300.0
                 amplitude = pulse_amplitude(tx.tx_time, tx.pulse_width, env.current_time - t_arrival)
 
                 if amplitude <= 1e-12
@@ -171,7 +172,11 @@ function propagate!(env::RadarEnvironment)
         xi = findnearest(env.grid_x, rx.position[1])
         yi = findnearest(env.grid_y, rx.position[2])
         observed = env.wavefield[xi, yi]
-        push!(rx.received_power, observed)
+        if env.current_time < rx.min_receive_time
+            push!(rx.received_power, 0)
+        else
+            push!(rx.received_power, observed)
+        end
     end
 end
 
