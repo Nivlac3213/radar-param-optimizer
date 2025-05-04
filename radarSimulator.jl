@@ -1,69 +1,191 @@
-c = 3*10^8 # Speed of light
-f = 1e9 # Frequency
-λ = c/f # Wavelength 
+using StaticArrays
+using LinearAlgebra
+using Distributions
+using Plots
 
-# Radar observation model (noisy power, phase, delay, doppler)
+# Abstract transmitter type
+abstract type AbstractTransmitter end
 
-# decrease noise_std with certain action factors
-
-
-# Example radar return model
-function radar_return_power(λ,R; Pt=1, Gt=1, Gr=1,rcs=1, L=1, noise_std=0)
-    # Pt: Transmit power
-    # Gt: Transmit gain
-    # Gr: Receive gain
-    # rcs: Radar cross section
-    # L: Losses
-    return Pt * Gt * Gr * rcs * λ^2 / (16 * π^3 * R^4 * L) + noise_std*randn()
+# PointTransmitter
+struct PointTransmitter <: AbstractTransmitter
+    position::SVector{2, Float64}
+    frequency::Float64
+    power::Float64
+    tx_time::Float64
+    pulse_width::Float64
+    steering_angle::Float64
+    beamwidth::Float64
+    is_isotropic::Bool
 end
 
-function radar_return_delay(R; noise_std=0)
-    # R: Range to target (m)
-    # Modify to scpecify a range gate with τ and Tipp
-    return 2*R/c + noise_std*randn()
+# Reflector
+mutable struct Reflector
+    position::SVector{2, Float64}
+    pulse_width::Float64
+    reflection_gain::Float64
+    has_reflected::Bool
 end
 
-function radar_range(T_delay; noise_std=0)
-    # T_delay: Delay (s)
-    return c*T_delay/2 + noise_std*randn()
+# Receiver
+mutable struct Receiver
+    position::SVector{2, Float64}
+    received_power::Vector{Float64}
 end
 
-function radar_view_angle(x,y,radar_location; noise_std=0)
-    return atand(x-radar_location[1], y-radar_location[2]) + noise_std*randn()
+# Radar environment
+mutable struct RadarEnvironment
+    grid_x::Vector{Float64}
+    grid_y::Vector{Float64}
+    wavefield::Matrix{Float64}
+    transmitters::Vector{PointTransmitter}
+    reflectors::Vector{Reflector}
+    receivers::Vector{Receiver}
+    current_time::Float64
 end
 
-function radar_doppler(state; noise_std=0)
-    # state: (x, y, vx, vy)    
-
-    x, y, vx, vy = state
-    r_hat = [x,y]
-    v_hat = [vx, vy]
-    Ψ = dot(r_hat *r_hat) / (norm(r_hat) * norm(v_hat)) # Angle between r and v
-    V = sqrt(vx^2 + vy^2)                               # Velocity magnitude
-    
-    return 2*V*cos(Ψ)/λ + noise_std*randn()
-
+function RadarEnvironment(grid_x::Vector{Float64}, grid_y::Vector{Float64})
+    wavefield = zeros(length(grid_x), length(grid_y))
+    transmitters = PointTransmitter[]
+    reflectors = Reflector[]
+    receivers = Receiver[]
+    current_time = 0.0
+    return RadarEnvironment(grid_x, grid_y, wavefield, transmitters, reflectors, receivers, current_time)
 end
 
-function radar_range_resolution(τ; noise_std=0)
-    # τ: Pulse width (s)
-    return c*τ/2 + noise_std*randn()
+function add_transmitter!(env::RadarEnvironment, tx::PointTransmitter)
+    push!(env.transmitters, tx)
 end
 
-function radar_unambiguous_range(T_ipp; noise_std=0)
-    # T_ipp: interpulse period (s)
-    return c*T_ipp/2 + noise_std*randn()
+function rm_transmitter!(env::RadarEnvironment, tx::PointTransmitter)
+    env.transmitters = filter(x -> x != tx, env.transmitters)
 end
 
-function radar_meas_2_obs_state(measurements; noise_std=0)
-    # measurements: (range, delay, doppler, power)
-    
-    power, view_angle, delay, doppler_freq = measurements
+function add_reflector!(env::RadarEnvironment, refl::Reflector)
+    push!(env.reflectors, refl)
+end
 
-    R_obs = radar_range(delay)
+function add_receiver!(env::RadarEnvironment, rx::Receiver)
+    push!(env.receivers, rx)
+end
 
-    
+function pulse_amplitude(tx_time::Float64, pulse_width::Float64, t::Float64)
+    return pdf(Normal(tx_time, pulse_width), t)
+end
+
+function findnearest(grid::Vector{Float64}, val::Float64)
+    return findmin(abs.(grid .- val))[2]
+end
+
+function snap_to_grid(grid::Vector{Float64}, pos::SVector{2, Float64})
+    ix = findnearest(grid, pos[1])
+    iy = findnearest(grid, pos[2])
+    return SVector(grid[ix], grid[iy])
+end
+
+function propagate!(env::RadarEnvironment)
+    env.wavefield .= 0.0
+
+    new_transmitters = PointTransmitter[]
+
+    for tx in env.transmitters
+        if env.current_time < tx.tx_time
+            continue
+        end
+
+        for (i, xi) in enumerate(env.grid_x)
+            for (j, yj) in enumerate(env.grid_y)
+                pos = SVector(xi, yj)
+                r = norm(pos - tx.position)
+
+                # --- Beam steering logic ---
+                delta = pos - tx.position
+                if r == 0
+                    angle_diff = 0.0
+                else
+                    angle = atan(delta[2], delta[1]) * 180 / π
+                    if angle < 0
+                        angle += 360
+                    end
+
+                    angle_diff = abs(angle - tx.steering_angle)
+                    if angle_diff > 180
+                        angle_diff = 360 - angle_diff
+                    end
+                end
+
+                # Check if point is inside beam
+                if !tx.is_isotropic
+                    if angle_diff > tx.beamwidth / 2
+                        continue  # skip → outside beam
+                    end
+                end
+
+                # --- Pulse propagation ---
+                t_arrival = r / 300
+                amplitude = pulse_amplitude(tx.tx_time, tx.pulse_width, env.current_time - t_arrival)
+
+                if amplitude <= 1e-12
+                    continue
+                end
+
+                propagated_power = tx.power * amplitude / (r == 0 ? 1.0 : r^2)
+                env.wavefield[i, j] += propagated_power
+
+                # Reflector check
+                for refl in env.reflectors
+                    if refl.has_reflected
+                        continue
+                    end
+
+                    if pos == refl.position
+                        if propagated_power > 1e-12
+                            reflected_power = propagated_power * refl.reflection_gain
+                            reflect_time = env.current_time
+
+                            reflected_tx = PointTransmitter(
+                                refl.position,
+                                tx.frequency,
+                                reflected_power,
+                                reflect_time,
+                                refl.pulse_width,
+                                0.0,          # steering angle irrelevant
+                                360.0,        # full beam
+                                true          # isotropic flag
+                            )
+                            push!(new_transmitters, reflected_tx)
+
+                            println("Reflection triggered at ", refl.position, " power = ", reflected_power)
+
+                            refl.has_reflected = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    append!(env.transmitters, new_transmitters)
+
+    # Final receiver sampling (after propagation)
+    for rx in env.receivers
+        xi = findnearest(env.grid_x, rx.position[1])
+        yi = findnearest(env.grid_y, rx.position[2])
+        observed = env.wavefield[xi, yi]
+        push!(rx.received_power, observed)
+    end
+end
 
 
-    return (px, py, vx, vy)
+function step!(env::RadarEnvironment, dt::Float64)
+    env.current_time += dt
+    propagate!(env)
+end
+
+function plot_wavefield(env::RadarEnvironment)
+    log_wavefield = 10 .* log10.(env.wavefield' .+ 1e-12)
+
+    heatmap(env.grid_x, env.grid_y, log_wavefield, 
+        c=:viridis, xlabel="x (m)", ylabel="y (m)", 
+        title="Radar Wavefield at t = $(round(env.current_time, digits=2)) s",
+        clims=(-120, 0))
 end
