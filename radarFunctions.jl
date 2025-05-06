@@ -59,7 +59,7 @@ function boresight_polar_2_cartesian(range, angle)
     # x = r*cos(θ)
     # y = r*sin(θ)
     # range: range [m]
-    return (range*sind(-angle), range*cosd(angle))
+    return (range*sind(angle), range*cosd(angle))
 end
 
 function radar_meas_2_obs_state(measurements; noise_std=0)
